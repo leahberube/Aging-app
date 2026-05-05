@@ -10,8 +10,6 @@ import '../ble/notification_service.dart';
 import 'calibration_page.dart';
 import 'saved_files_page.dart';
 
-String _latestTimestampStatus = "unknown";
-
 class DashboardPage extends StatefulWidget {
   final BleService ble;
   final String deviceName;
@@ -33,15 +31,23 @@ class _DashboardPageState extends State<DashboardPage> {
   final List<String> _currentBurstLogs = [];
   final ScrollController _scrollCtrl = ScrollController();
 
+  String? _lastSavedKey;
+  DateTime? _lastSavedAt;
+
   StreamSubscription<String>? _logSub;
   StreamSubscription<int?>? _battSub;
   StreamSubscription<bool?>? _chgSub;
 
+  Timer? _burstCloseTimer;
+
   int? _batteryPercent;
   bool? _isCharging;
 
-  bool _isAutoSavingCsv = false;
   bool _burstInProgress = false;
+  bool _isAutoSavingCsv = false;
+  bool _burstSaveTriggered = false;
+
+  String? _currentTransmitType; // "recent" or "all"
 
   @override
   void initState() {
@@ -51,30 +57,63 @@ class _DashboardPageState extends State<DashboardPage> {
 
     _logSub = widget.ble.logStream.listen((line) {
       if (!mounted) return;
+
+      final s = line.trim().toLowerCase();
+
+      final isRelevant =
+          s == "# burst recent start" ||
+          s == "# burst recent end" ||
+          s == "# burst all start" ||
+          s == "# burst all end" ||
+          RegExp(r'^(\d+),(-?\d+(?:\.\d+)?)(,[012])?$').hasMatch(line.trim()) ||
+          RegExp(
+            r'^(\d{4}-\d{2}-\d{2}),(\d{2}:\d{2}:\d{2}),(-?\d+(?:\.\d+)?)(,(known|unknown|estimated))?$',
+          ).hasMatch(line.trim()) ||
+          RegExp(r'unix_ms=\d+\s+z=-?\d+(?:\.\d+)?', caseSensitive: false)
+              .hasMatch(line.trim());
+
+      if (!isRelevant) {
+        _logs.add(line);
+        setState(() {});
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollCtrl.hasClients) {
+            _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
+          }
+        });
+        return;
+      }
+
       _handleIncomingLogLine(line);
     });
 
-    _battSub = widget.ble.batteryPercentStream.listen((p) {
-      if (!mounted) return;
-      setState(() => _batteryPercent = p);
-    }, onError: (_) {
-      if (!mounted) return;
-      setState(() => _batteryPercent = null);
-    });
+    _battSub = widget.ble.batteryPercentStream.listen(
+      (p) {
+        if (!mounted) return;
+        setState(() => _batteryPercent = p);
+      },
+      onError: (_) {
+        if (!mounted) return;
+        setState(() => _batteryPercent = null);
+      },
+    );
 
-    _chgSub = widget.ble.chargingStream.listen((c) {
-      if (!mounted) return;
-      setState(() => _isCharging = c);
-    }, onError: (_) {
-      if (!mounted) return;
-      setState(() => _isCharging = null);
-    });
+    _chgSub = widget.ble.chargingStream.listen(
+      (c) {
+        if (!mounted) return;
+        setState(() => _isCharging = c);
+      },
+      onError: (_) {
+        if (!mounted) return;
+        setState(() => _isCharging = null);
+      },
+    );
 
     widget.ble.log("Dashboard opened for ${widget.deviceId}");
   }
 
   @override
   void dispose() {
+    _burstCloseTimer?.cancel();
     _logSub?.cancel();
     _battSub?.cancel();
     _chgSub?.cancel();
@@ -89,24 +128,99 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   void _handleIncomingLogLine(String line) {
-    final s = line.trim().toLowerCase();
+    final trimmed = line.trim();
+    final s = trimmed.toLowerCase();
 
-    // Always keep full terminal history
     _logs.add(line);
 
-    // Start of a BLE burst from firmware
-    if (s == "# burst recent start" || s == "# burst all start") {
+    final isBurstRecentStart = s == "# burst recent start";
+    final isBurstAllStart = s == "# burst all start";
+    final isBurstRecentEnd = s == "# burst recent end";
+    final isBurstAllEnd = s == "# burst all end";
+
+    final isBurstStart = isBurstRecentStart || isBurstAllStart;
+    final isBurstEnd = isBurstRecentEnd || isBurstAllEnd;
+
+    final isDataLine =
+        RegExp(r'^(\d+),(-?\d+(?:\.\d+)?)(,[012])?$').hasMatch(trimmed) ||
+        RegExp(
+          r'^(\d{4}-\d{2}-\d{2}),(\d{2}:\d{2}:\d{2}),(-?\d+(?:\.\d+)?)(,(known|unknown|estimated))?$',
+        ).hasMatch(trimmed) ||
+        RegExp(r'unix_ms=\d+\s+Z=-?\d+(?:\.\d+)?', caseSensitive: false)
+            .hasMatch(trimmed);
+
+    if (isBurstStart) {
+      final newType = isBurstRecentStart ? "recent" : "all";
+
+      if (_burstInProgress && _currentTransmitType == newType) {
+        setState(() {});
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollCtrl.hasClients) {
+            _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
+          }
+        });
+        return;
+      }
+
+      _burstCloseTimer?.cancel();
       _burstInProgress = true;
-      _currentBurstLogs.clear();
-      _currentBurstLogs.add(line);
+      _burstSaveTriggered = false;
+      _currentTransmitType = newType;
+      _currentBurstLogs
+        ..clear()
+        ..add(trimmed);
     } else if (_burstInProgress) {
-      _currentBurstLogs.add(line);
+      if (isDataLine || isBurstEnd) {
+        if (_currentBurstLogs.isEmpty || _currentBurstLogs.last != trimmed) {
+          _currentBurstLogs.add(trimmed);
+        }
+      }
     }
 
-    // End of a BLE burst from firmware
-    if (s == "# burst recent end" || s == "# burst all end") {
+    if (isBurstEnd) {
+      final endType = isBurstRecentEnd ? "recent" : "all";
+
+      if (!_burstInProgress || _currentTransmitType != endType) {
+        setState(() {});
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollCtrl.hasClients) {
+            _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
+          }
+        });
+        return;
+      }
+
+      if (_burstSaveTriggered) {
+        setState(() {});
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scrollCtrl.hasClients) {
+            _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
+          }
+        });
+        return;
+      }
+
       _burstInProgress = false;
-      _autoSaveCsvAfterBurst();
+      _burstSaveTriggered = true;
+
+      final burstSnapshot = List<String>.from(_currentBurstLogs);
+      final transmitTypeSnapshot = _currentTransmitType;
+
+      _burstCloseTimer?.cancel();
+      _burstCloseTimer = Timer(const Duration(milliseconds: 300), () async {
+        final csv = _buildCsvFromLogList(burstSnapshot);
+
+        if (csv.trim().isEmpty) {
+          _isAutoSavingCsv = false;
+          _currentTransmitType = null;
+          return;
+        }
+
+        await _autoSaveCsvAfterBurst(
+          burstLogs: burstSnapshot,
+          transmitType: transmitTypeSnapshot,
+        );
+      });
     }
 
     setState(() {});
@@ -118,7 +232,6 @@ class _DashboardPageState extends State<DashboardPage> {
     });
   }
 
-
   String _buildCsvFromLogList(List<String> sourceLogs) {
     final lines = <String>[];
     lines.add("date,time,impedance_ohm,timestamp_status");
@@ -129,7 +242,6 @@ class _DashboardPageState extends State<DashboardPage> {
 
       final lower = s.toLowerCase();
 
-      // Ignore headers / comments / markers
       if (lower == "time,impedance_ohm" ||
           lower == "unix_s,impedance_ohm" ||
           lower == "unix_s,impedance_ohm,time_status" ||
@@ -139,10 +251,8 @@ class _DashboardPageState extends State<DashboardPage> {
         continue;
       }
 
-      // 1) New firmware format: unix_s,impedance,time_status
-      final unixSStatusMatch = RegExp(
-        r'^(\d+),(-?\d+(?:\.\d+)?),([012])$',
-      ).firstMatch(s);
+      final unixSStatusMatch =
+          RegExp(r'^(\d+),(-?\d+(?:\.\d+)?),([012])$').firstMatch(s);
 
       if (unixSStatusMatch != null) {
         final unixS = int.parse(unixSStatusMatch.group(1)!);
@@ -180,10 +290,8 @@ class _DashboardPageState extends State<DashboardPage> {
         continue;
       }
 
-      // 2) Old debug format: unix_ms=... Z=...
-      final msMatch = RegExp(
-        r'unix_ms=(\d+)\s+Z=(-?\d+(?:\.\d+)?)',
-      ).firstMatch(s);
+      final msMatch =
+          RegExp(r'unix_ms=(\d+)\s+Z=(-?\d+(?:\.\d+)?)').firstMatch(s);
 
       if (msMatch != null) {
         final unixMs = int.parse(msMatch.group(1)!);
@@ -208,10 +316,8 @@ class _DashboardPageState extends State<DashboardPage> {
         continue;
       }
 
-      // 3) Older format: unix_s,impedance
-      final unixSMatch = RegExp(
-        r'^(\d+),(-?\d+(?:\.\d+)?)$',
-      ).firstMatch(s);
+      final unixSMatch =
+          RegExp(r'^(\d+),(-?\d+(?:\.\d+)?)$').firstMatch(s);
 
       if (unixSMatch != null) {
         final unixS = int.parse(unixSMatch.group(1)!);
@@ -236,21 +342,18 @@ class _DashboardPageState extends State<DashboardPage> {
         continue;
       }
 
-      // 4) Already formatted: date,time,impedance
-      final datedMatch = RegExp(
-        r'^(\d{4}-\d{2}-\d{2}),(\d{2}:\d{2}:\d{2}),(-?\d+(?:\.\d+)?)$',
-      ).firstMatch(s);
+      final datedMatch =
+          RegExp(r'^(\d{4}-\d{2}-\d{2}),(\d{2}:\d{2}:\d{2}),(-?\d+(?:\.\d+)?)$')
+              .firstMatch(s);
 
       if (datedMatch != null) {
         final dateStr = datedMatch.group(1)!;
         final timeStr = datedMatch.group(2)!;
         final impedance = datedMatch.group(3)!;
-
         lines.add("$dateStr,$timeStr,$impedance,unknown");
         continue;
       }
 
-      // 5) Already formatted: date,time,impedance,status
       final datedStatusMatch = RegExp(
         r'^(\d{4}-\d{2}-\d{2}),(\d{2}:\d{2}:\d{2}),(-?\d+(?:\.\d+)?),(known|unknown|estimated)$',
       ).firstMatch(s);
@@ -260,47 +363,67 @@ class _DashboardPageState extends State<DashboardPage> {
         final timeStr = datedStatusMatch.group(2)!;
         final impedance = datedStatusMatch.group(3)!;
         final status = datedStatusMatch.group(4)!;
-
         lines.add("$dateStr,$timeStr,$impedance,$status");
-        continue;
       }
     }
 
-    if (lines.length == 1) return "";
+    if (lines.length == 1) {
+      final rawCsvish = sourceLogs
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty && !e.startsWith('#'))
+          .join("\n");
+
+      if (rawCsvish.isEmpty) return "";
+      return "date,time,impedance_ohm,timestamp_status\n$rawCsvish\n";
+    }
+
     return "${lines.join("\n")}\n";
   }
 
   String _buildCsvFromLogs() => _buildCsvFromLogList(_logs);
 
-  String _buildCsvFromCurrentBurst() => _buildCsvFromLogList(_currentBurstLogs);
-
   Future<void> _saveCsv({
+    required String csv,
     bool showShareSheet = true,
-    bool burstOnly = false,
+    bool showSavedSnackbar = true,
+    String? filenameSuffix,
   }) async {
-    final csv = burstOnly ? _buildCsvFromCurrentBurst() : _buildCsvFromLogs();
+    final normalizedCsv = csv.trim();
+    if (normalizedCsv.isEmpty) {
+      throw Exception("No CSV data to save.");
+    }
 
-    if (csv.trim().isEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No CSV data to save yet.")),
-      );
+    // Prevent duplicate saves of the same CSV within a short window.
+    final saveKey = '${filenameSuffix ?? ""}::$normalizedCsv';
+    final now = DateTime.now();
+
+    if (_lastSavedKey == saveKey &&
+        _lastSavedAt != null &&
+        now.difference(_lastSavedAt!) < const Duration(seconds: 2)) {
+      debugPrint("Skipping duplicate CSV save");
       return;
     }
 
+    _lastSavedKey = saveKey;
+    _lastSavedAt = now;
+
     final dir = await getApplicationDocumentsDirectory();
-    final ts = DateTime.now().toIso8601String().replaceAll(':', '-');
-    final suffix = burstOnly ? "_burst" : "";
+    final ts = now.toIso8601String().replaceAll(':', '-');
+    final suffix = (filenameSuffix == null || filenameSuffix.isEmpty)
+        ? ""
+        : "_$filenameSuffix";
     final filename = "${widget.deviceName}_${ts}$suffix.csv";
     final file = File("${dir.path}/$filename");
 
-    await file.writeAsString(csv);
+    await file.writeAsString('$normalizedCsv\n');
 
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Saved: $filename")),
-    );
+    if (showSavedSnackbar) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Saved: $filename")),
+      );
+    }
 
     if (!showShareSheet) return;
 
@@ -320,20 +443,57 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
-  Future<void> _autoSaveCsvAfterBurst() async {
+  Future<void> _autoSaveCsvAfterBurst({
+    required List<String> burstLogs,
+    required String? transmitType,
+  }) async {
     if (_isAutoSavingCsv) return;
     _isAutoSavingCsv = true;
 
     try {
-      await Future.delayed(const Duration(milliseconds: 300));
-      await _saveCsv(showShareSheet: false, burstOnly: true);
+      final csv = _buildCsvFromLogList(burstLogs);
+
+      if (csv.trim().isEmpty) {
+        throw Exception("Transmit finished but no CSV data was found.");
+      }
+
+      await _saveCsv(
+        csv: csv,
+        showShareSheet: false,
+        showSavedSnackbar: false,
+        filenameSuffix: transmitType == "recent" ? "recent" : "all",
+      );
 
       if (!mounted) return;
+
+      final successMessage = transmitType == "recent"
+          ? "Recent data auto-saved successfully."
+          : "All data auto-saved successfully.";
+
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("CSV auto-saved after transmit.")),
+        SnackBar(content: Text(successMessage)),
+      );
+
+      await NotificationService.showTransmitSuccess(
+        deviceName: widget.deviceName,
+        message: successMessage,
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      final failureMessage = "$e";
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(failureMessage)),
+      );
+
+      await NotificationService.showTransmitFailure(
+        deviceName: widget.deviceName,
+        message: failureMessage,
       );
     } finally {
       _isAutoSavingCsv = false;
+      _currentTransmitType = null;
     }
   }
 
@@ -458,6 +618,12 @@ class _DashboardPageState extends State<DashboardPage> {
     if (!mounted || choice == null) return;
 
     try {
+      _burstCloseTimer?.cancel();
+      _burstInProgress = false;
+      _burstSaveTriggered = false;
+      _currentBurstLogs.clear();
+      _currentTransmitType = choice;
+
       if (choice == "all") {
         widget.ble.log("Transmit all pressed");
         await widget.ble.startTransmit(widget.deviceId);
@@ -466,7 +632,7 @@ class _DashboardPageState extends State<DashboardPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Transmit all started")),
         );
-      } else if (choice == "recent") {
+      } else {
         widget.ble.log("Transmit recent pressed");
         await widget.ble.startTransmitRecent(widget.deviceId);
 
@@ -480,6 +646,11 @@ class _DashboardPageState extends State<DashboardPage> {
       widget.ble.log("Transmit failed: $e");
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("Transmit failed: $e")),
+      );
+
+      await NotificationService.showTransmitFailure(
+        deviceName: widget.deviceName,
+        message: "Transmit command failed: $e",
       );
     }
   }
@@ -537,9 +708,7 @@ class _DashboardPageState extends State<DashboardPage> {
                             if (!mounted) return;
                             ble.log("Reconnect failed: $e");
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text("Reconnect failed: $e"),
-                              ),
+                              SnackBar(content: Text("Reconnect failed: $e")),
                             );
                           }
                         },
@@ -578,7 +747,11 @@ class _DashboardPageState extends State<DashboardPage> {
                   onPressed: () async {
                     try {
                       ble.log("Save as CSV pressed");
-                      await _saveCsv();
+                      await _saveCsv(
+                        csv: _buildCsvFromLogs(),
+                        showShareSheet: true,
+                        showSavedSnackbar: true,
+                      );
                     } catch (e) {
                       if (!mounted) return;
                       ble.log("Save CSV failed: $e");
@@ -607,7 +780,7 @@ class _DashboardPageState extends State<DashboardPage> {
                     );
                   },
                   icon: const Icon(Icons.folder),
-                  label: const Text('Files'),
+                  label: const Text("Files"),
                 ),
               ],
             ),
