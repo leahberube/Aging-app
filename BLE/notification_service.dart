@@ -2,6 +2,12 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 
+enum TransmitStatus {
+  success,
+  failed,
+  timeout,
+}
+
 class NotificationService {
   static final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
@@ -11,18 +17,24 @@ class NotificationService {
   static Future<void> init() async {
     if (_initialized) return;
 
-    const iosSettings = DarwinInitializationSettings();
+    const darwinSettings = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+      defaultPresentAlert: true,
+      defaultPresentBadge: true,
+      defaultPresentSound: true,
+      defaultPresentBanner: true,
+      defaultPresentList: true,
+    );
 
     const initSettings = InitializationSettings(
-      iOS: iosSettings,
+      iOS: darwinSettings,
     );
 
     await _notifications.initialize(
       settings: initSettings,
     );
-
-    tz.initializeTimeZones();
-    tz.setLocalLocation(tz.getLocation('America/New_York'));
 
     await _notifications
         .resolvePlatformSpecificImplementation<
@@ -33,71 +45,92 @@ class NotificationService {
           sound: true,
         );
 
+    tz.initializeTimeZones();
+    tz.setLocalLocation(tz.getLocation('America/New_York'));
+
     _initialized = true;
   }
 
-  static Future<void> scheduleThreeDailyNotifications() async {
-    await init();
+  static Future<void> showTransmitResult({
+    required String deviceName,
+    required TransmitStatus status,
+    required String message,
+  }) async {
+    String title;
 
-    await _notifications.cancelAll();
+    switch (status) {
+      case TransmitStatus.success:
+        title = '$deviceName transmit complete';
+        break;
+      case TransmitStatus.failed:
+        title = '$deviceName transmit failed';
+        break;
+      case TransmitStatus.timeout:
+        title = '$deviceName transmit timed out';
+        break;
+    }
 
-    await _scheduleDailyNotification(
-      id: 1,
-      title: 'Sensor Sync',
-      body: 'Open the app to transmit stored data.',
-      hour: 9,
-      minute: 0,
+    const details = NotificationDetails(
+      iOS: DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        presentBanner: true,
+        presentList: true,
+      ),
     );
 
-    await _scheduleDailyNotification(
-      id: 2,
-      title: 'Sensor Sync',
-      body: 'Open the app to transmit stored data.',
-      hour: 14,
-      minute: 0,
-    );
-
-    await _scheduleDailyNotification(
-      id: 3,
-      title: 'Sensor Sync',
-      body: 'Open the app to transmit stored data.',
-      hour: 20,
-      minute: 0,
+    await _notifications.show(
+      id: DateTime.now().millisecondsSinceEpoch.remainder(100000),
+      title: title,
+      body: message,
+      notificationDetails: details,
     );
   }
 
-  static Future<void> _scheduleDailyNotification({
-    required int id,
+  static Future<void> showSummaryNotification({
     required String title,
     required String body,
-    required int hour,
-    required int minute,
   }) async {
-    final now = tz.TZDateTime.now(tz.local);
-
-    var scheduled = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      hour,
-      minute,
+    const details = NotificationDetails(
+      iOS: DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+        presentBanner: true,
+        presentList: true,
+      ),
     );
 
-    if (scheduled.isBefore(now)) {
-      scheduled = scheduled.add(const Duration(days: 1));
-    }
-
-    await _notifications.zonedSchedule(
-      id: id,
+    await _notifications.show(
+      id: DateTime.now().millisecondsSinceEpoch.remainder(100000),
       title: title,
       body: body,
-      scheduledDate: scheduled,
-      notificationDetails: const NotificationDetails(
-        iOS: DarwinNotificationDetails(),
-      ),
-      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-      matchDateTimeComponents: DateTimeComponents.time,
+      notificationDetails: details,
+    );
+  }
+
+  static Future<void> scheduleThreeDailyNotifications() async {}
+
+  static Future<void> showTransmitSuccess({
+    required String deviceName,
+    required String message,
+  }) async {
+    await showTransmitResult(
+      deviceName: deviceName,
+      status: TransmitStatus.success,
+      message: message,
+    );
+  }
+
+  static Future<void> showTransmitFailure({
+    required String deviceName,
+    required String message,
+  }) async {
+    await showTransmitResult(
+      deviceName: deviceName,
+      status: TransmitStatus.failed,
+      message: message,
     );
   }
 }
